@@ -94,6 +94,7 @@ import torch
 from einops import rearrange, repeat
 from torch import nn, einsum
 
+import torch.nn.functional as F
 from ldm.models.diffusion.ddpm import LatentDiffusion as LatentDiffusion
 from ldm.util import default
 from ldm.modules.attention import BasicTransformerBlock as BasicTransformerBlock
@@ -102,10 +103,12 @@ from ldm.util import log_txt_as_img, exists, ismap, isimage, mean_flat, count_pa
 from torchvision.utils import make_grid
 from ldm.models.autoencoder import VQModelInterface, IdentityFirstStage, AutoencoderKL
 import numpy as np
+from typing import Optional, List, Type, Set
+
 
 class LoraInjectedLinear(nn.Module):
     def __init__(
-        self, in_features, out_features, bias=False, r=4, dropout_p=0.1, scale=1.0
+        self, in_features, out_features, bias=False, old_weight=None, old_bias=None, device=None, dtype=None, r=4
     ):
         super().__init__()
 
@@ -114,25 +117,20 @@ class LoraInjectedLinear(nn.Module):
                 f"LoRA rank {r} must be less or equal than {min(in_features, out_features)}"
             )
         self.r = r
-        self.linear = nn.Linear(in_features, out_features, bias)
-        self.lora_down = nn.Linear(in_features, r, bias=False)
-        self.dropout = nn.Dropout(dropout_p)
-        self.lora_up = nn.Linear(r, out_features, bias=False)
-        self.scale = scale
-        self.selector = nn.Identity()
+        factory_kwargs = {'device': device, 'dtype': dtype}
+        
+        self.old_weight = old_weight
+        self.old_bias = old_bias
+        self.lora_down = torch.nn.Parameter(torch.zeros((out_features, r), **factory_kwargs))
+        self.lora_up = torch.nn.Parameter(torch.zeros((r, in_features), **factory_kwargs))
 
-        nn.init.normal_(self.lora_down.weight, std=1 / r)
-        nn.init.zeros_(self.lora_up.weight)
+    def forward(self, x):
+        weight = self.old_weight + self.lora_down @ self.lora_up
+        output = F.linear(x, weight, bias=self.old_bias)
+        return output
 
-    def forward(self, input):
-        return (
-            self.linear(input)
-            + self.dropout(self.lora_up(self.selector(self.lora_down(input))))
-            * self.scale
-        )
-
-    def realize_as_lora(self):
-        return self.lora_up.weight.data * self.scale, self.lora_down.weight.data
+    def realize_as_lorsa(self):
+        return self.lora_up, self.lora_down
 
     def set_selector_from_diag(self, diag: torch.Tensor):
         # diag is a 1D tensor of size (r,)
@@ -143,10 +141,147 @@ class LoraInjectedLinear(nn.Module):
             self.lora_up.weight.device
         ).to(self.lora_up.weight.dtype)
 
+
+class LorsaInjectedLinear(nn.Module):
+    def __init__(
+        self, in_features, out_features, bias=False, old_weight=None, old_bias=None, device=None, dtype=None, r=4, shrinkage_threshold=0.001,
+    ):
+        super().__init__()
+
+        if r > min(in_features, out_features):
+            raise ValueError(
+                f"LoRA rank {r} must be less or equal than {min(in_features, out_features)}"
+            )
+        self.r = r
+        factory_kwargs = {'device': device, 'dtype': dtype}
+        
+        self.old_weight = old_weight
+        self.old_bias = old_bias
+        self.lora_down = torch.nn.Parameter(torch.zeros((out_features, r), **factory_kwargs))
+        self.lora_up = torch.nn.Parameter(torch.zeros((r, in_features), **factory_kwargs))
+        self.sparsity = torch.nn.Parameter(torch.randn((out_features, in_features), **factory_kwargs))
+        self.shrinkage_threshold = shrinkage_threshold
+
+    def forward(self, x):
+        weight = self.old_weight + self.sparsity + self.lora_down @ self.lora_up
+        output = F.linear(x, weight, bias=self.old_bias)
+        return output
+
+    def realize_as_lorsa(self):
+        return self.lora_up, self.lora_down, self.sparsity
+
+    def set_selector_from_diag(self, diag: torch.Tensor):
+        # diag is a 1D tensor of size (r,)
+        assert diag.shape == (self.r,)
+        self.selector = nn.Linear(self.r, self.r, bias=False)
+        self.selector.weight.data = torch.diag(diag)
+        self.selector.weight.data = self.selector.weight.data.to(
+            self.lora_up.weight.device
+        ).to(self.lora_up.weight.dtype)
+
+# Possible bug causes
+# missing dropout in InjectedLinear
+# existence of InjectedLinear
+# not doing the same masking as their change_forward
+# not commenting out their change_forward
+# something seems fucked up about my initialization because it can't even generate people
+# would be faster if my injected layers add weights and biases rather than running multiple times, will need to get rid of dropout
+
+
+class InjectedLinear(nn.Module):
+    def __init__(
+        self, in_features, out_features, bias=False, old_weight=None, old_bias=None, device=None, dtype=None
+    ):
+        super().__init__()
+        factory_kwargs = {'device': device, 'dtype': dtype}
+
+        self.injected_linear_weight = torch.nn.Parameter(torch.zeros((out_features, in_features), **factory_kwargs))
+        self.injected_linear_bias = torch.nn.Parameter(torch.zeros((out_features), **factory_kwargs)) if bias else None
+        self.old_weight = old_weight
+        self.old_bias = old_bias
+        # self.selector = nn.Identity()
+
+    def forward(self, x):
+        weight = self.old_weight + self.injected_linear_weight
+        bias = self.old_bias + self.injected_linear_bias if self.old_bias else None
+        output = F.linear(x, weight, bias=bias)
+        return output
+
+    def set_selector_from_diag(self, diag: torch.Tensor):
+        # diag is a 1D tensor of size (r,)
+        assert diag.shape == (self.r,)
+        self.selector = nn.Linear(self.r, self.r, bias=False)
+        self.selector.weight.data = torch.diag(diag)
+        self.selector.weight.data = self.selector.weight.data.to(
+            self.linear.weight.device
+        ).to(self.linear.weight.dtype)
+
+
+# Modified from https://github.com/cloneofsimo/lora/blob/bdd51b04c49fa90a88919a19850ec3b4cf3c5ecd/lora_diffusion/lora.py#L189
+def _find_modules(
+    model,
+    ancestor_class: Optional[Set[str]] = None,
+    search_class: List[Type[nn.Module]] = [nn.Linear],
+    exclude_children_of: Optional[List[Type[nn.Module]]] =
+    [
+        LoraInjectedLinear,
+        LorsaInjectedLinear,
+        InjectedLinear,
+    ],
+):
+    """
+    Find all modules of a certain class (or union of classes) that are direct or
+    indirect descendants of other modules of a certain class (or union of classes).
+
+    Returns all matching modules, along with the parent of those moduless and the
+    names they are referenced by.
+    """
+
+    # Get the targets we should replace all linears under
+    if ancestor_class is not None:
+        ancestors = (
+            module
+            for module in model.modules()
+            if module.__class__.__name__ in ancestor_class
+        )
+    else:
+        # this, incase you want to naively iterate over all modules.
+        ancestors = [module for module in model.modules()]
+
+    # For each target find every linear_class module that isn't a child of a LoraInjectedLinear
+    for ancestor in ancestors:
+        for fullname, module in ancestor.named_modules():
+            if any([isinstance(module, _class) for _class in search_class]):
+                # Find the direct parent if this is a descendant, not a child, of target
+                *path, name = fullname.split(".")
+                parent = ancestor
+                # print(f'considering {fullname} of type {module}')
+                while path:
+                    parent = parent.get_submodule(path.pop(0))
+                    # print(f'parent class is {parent}, condition is {any([isinstance(parent, _class) for _class in exclude_children_of])}')
+                # Skip this linear if it's a child of a LoraInjectedLinear
+                if exclude_children_of and any(
+                    [isinstance(parent, _class) for _class in exclude_children_of]
+                ):
+                    # print(f'skipping parent class {parent}')
+                    continue
+                # Skip this linear if it's one of our special ones
+                if any([keyword in fullname for keyword in ['injected', 'sparse', 'lora', 'extra']]):
+                    # print(f'skipping {fullname}')
+                    continue
+                # Sanity check: only edit crossattn k and v weights
+                if not any([keyword in fullname for keyword in ['to_k', 'to_v']]):
+                    # print(f'skipping {fullname}')
+                    continue
+                # Otherwise, yield it
+                # print(f'keeping {fullname}')
+                yield parent, name, module
+
 class CustomDiffusion(LatentDiffusion):
     def __init__(self,
                  freeze_model='crossattn-kv',
                  lora_rank=None,
+                 shrinkage_threshold=0.0,
                  cond_stage_trainable=False,
                  add_token=False,
                  *args, **kwargs):
@@ -154,8 +289,10 @@ class CustomDiffusion(LatentDiffusion):
         self.freeze_model = freeze_model
         self.add_token = add_token
         self.cond_stage_trainable = cond_stage_trainable
+        self.shrinkage_threshold = shrinkage_threshold
         super().__init__(cond_stage_trainable=cond_stage_trainable, *args, **kwargs)
 
+        self.require_grad_params = None
 
         def change_checkpoint(model):
             for layer in model.children():
@@ -166,124 +303,242 @@ class CustomDiffusion(LatentDiffusion):
 
         change_checkpoint(self.model.diffusion_model)
 
-        def new_forward(self, x, context=None, mask=None):
-            h = self.heads
-            crossattn = False
-            if context is not None:
-                crossattn = True
-            q = self.to_q(x)
-            context = default(context, x)
-            k = self.to_k(context)
-            v = self.to_v(context)
+        # def new_forward(self, x, context=None, mask=None):
+        #     h = self.heads
+        #     crossattn = False
+        #     if context is not None:
+        #         crossattn = True
+        #     q = self.to_q(x)
+        #     context = default(context, x)
+        #     k = self.to_k(context)
+        #     v = self.to_v(context)
 
-            if crossattn:
-                modifier = torch.ones_like(k)
-                modifier[:, :1, :] = modifier[:, :1, :]*0.
-                k = modifier*k + (1-modifier)*k.detach()
-                v = modifier*v + (1-modifier)*v.detach()
+        #     if crossattn:
+        #         modifier = torch.ones_like(k)
+        #         modifier[:, :1, :] = modifier[:, :1, :]*0.
+        #         k = modifier*k + (1-modifier)*k.detach()
+        #         v = modifier*v + (1-modifier)*v.detach()
 
-            q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
-            sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
-            attn = sim.softmax(dim=-1)
+        #     q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
+        #     sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
+        #     attn = sim.softmax(dim=-1)
 
-            out = einsum('b i j, b j d -> b i d', attn, v)
-            out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
-            return self.to_out(out)
+        #     out = einsum('b i j, b j d -> b i d', attn, v)
+        #     out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
+        #     return self.to_out(out)
 
-        def change_forward(model):
-            for name, layer in model.named_children():
-                if type(layer) == CrossAttention and 'attn2' in name:
-                    bound_method = new_forward.__get__(layer, layer.__class__)
-                    setattr(layer, 'forward', bound_method)
-                else:
-                    change_forward(layer)
+        # def change_forward(model):
+        #     for name, layer in model.named_children():
+        #         if type(layer) == CrossAttention and 'attn2' in name:
+        #             bound_method = new_forward.__get__(layer, layer.__class__)
+        #             setattr(layer, 'forward', bound_method)
+        #         else:
+        #             change_forward(layer)
 
-        change_forward(self.model.diffusion_model)
+        # change_forward(self.model.diffusion_model)
 
+        # # At first, set all parameters to not be updated
+        for x in self.model.diffusion_model.named_parameters():
+            x[1].requires_grad = False
 
-        if self.freeze_model == 'crossattn-kv':
-            for x in self.model.diffusion_model.named_parameters():
-                if 'transformer_blocks' not in x[0]:
-                    x[1].requires_grad = False
-                elif not ('attn2.to_k' in x[0] or 'attn2.to_v' in x[0]):
-                    x[1].requires_grad = False
-                else:
-                    x[1].requires_grad = True
-        elif self.freeze_model == 'crossattn-kv-lora':
-            for x in self.model.diffusion_model.named_parameters():
-                if 'transformer_blocks' not in x[0]:
-                    x[1].requires_grad = False
-                elif not ('lora_up' in x[0] or 'lora_down' in x[0]):
-                    x[1].requires_grad = False
-                else:
-                    x[1].requires_grad = True
-        elif self.freeze_model == 'crossattn':
-            for x in self.model.diffusion_model.named_parameters():
-                if 'transformer_blocks' not in x[0]:
-                    x[1].requires_grad = False
-                elif not 'attn2' in x[0]:
-                    x[1].requires_grad = False
-                else:
-                    x[1].requires_grad = True
+        # if self.freeze_model == 'crossattn-kv':
+        #     for x in self.model.diffusion_model.named_parameters():
+        #         if 'transformer_blocks' not in x[0]:
+        #             x[1].requires_grad = False
+        #         elif not ('attn2.to_k' in x[0] or 'attn2.to_v' in x[0]):
+        #             x[1].requires_grad = False
+        #         else:
+        #             x[1].requires_grad = True
+        # elif self.freeze_model == 'crossattn-kv-lora':
+        #     for x in self.model.diffusion_model.named_parameters():
+        #         if 'transformer_blocks' not in x[0]:
+        #             x[1].requires_grad = False
+        #         elif not ('lora_up' in x[0] or 'lora_down' in x[0]):
+        #             x[1].requires_grad = False
+        #         else:
+        #             x[1].requires_grad = True
+        # elif self.freeze_model == 'crossattn-kv-lorsa':
+        #     for x in self.model.diffusion_model.named_parameters():
+        #         if 'transformer_blocks' not in x[0]:
+        #             x[1].requires_grad = False
+        #         elif not ('lora_up' in x[0] or 'lora_down' in x[0] or 'sparse_linear' in x[0]):
+        #             x[1].requires_grad = False
+        #         else:
+        #             x[1].requires_grad = True
+        # elif self.freeze_model == 'crossattn':
+        #     for x in self.model.diffusion_model.named_parameters():
+        #         if 'transformer_blocks' not in x[0]:
+        #             x[1].requires_grad = False
+        #         elif not 'attn2' in x[0]:
+        #             x[1].requires_grad = False
+        #         else:
+        #             x[1].requires_grad = True
+        # elif self.freeze_model == 'weight':
+        #     for x in self.model.diffusion_model.named_parameters():
+        #         if 'weight' in x[0]:
+        #             x[1].requires_grad = True
+        #         else:
+        #             x[1].requires_grad = False
+        # elif self.freeze_model == 'weight-lora':
+        #     for x in self.model.diffusion_model.named_parameters():
+        #         if 'weight' not in x[0]:
+        #             x[1].requires_grad = False
+        #         elif not ('lora_up' in x[0] or 'lora_down' in x[0]):
+        #             x[1].requires_grad = False
+        #         else:
+        #             x[1].requires_grad = True
+        # elif self.freeze_model == 'weight-lorsa':
+        #     for x in self.model.diffusion_model.named_parameters():
+        #         if 'weight' not in x[0]:
+        #             x[1].requires_grad = False
+        #         elif not ('lora_up' in x[0] or 'lora_down' in x[0] or 'sparse_linear' in x[0]):
+        #             x[1].requires_grad = False
+        #         else:
+        #             x[1].requires_grad = True
         #breakpoint()
 
+    # Modified from https://github.com/cloneofsimo/lora/blob/bdd51b04c49fa90a88919a19850ec3b4cf3c5ecd/lora_diffusion/lora.py#L254
     def inject_trainable_lora(self, lora_rank):
         def change_forward(model):
-            for name, layer in model.named_children():
-                if type(layer) == CrossAttention and 'attn2' in name:
-                    for _child_name in ['to_k', 'to_v']:
-                        _child_module = layer._modules[_child_name]
-                        _tmp = LoraInjectedLinear(
-                            _child_module.in_features,
-                            _child_module.out_features,
-                            _child_module.bias is not None,
-                            r=lora_rank,
-                            dropout_p=0.0,
-                            scale=1.0,
-                            )
-                        _tmp.linear.weight = _child_module.weight
-                        
-                        if _child_module.bias is not None:
-                            _tmp.linear.bias = _child_module.bias
+            self.require_grad_params = []
+            self.names = []
 
-                        _tmp.to(_child_module.weight.device).to(_child_module.weight.dtype)
+            for _module, name, _child_module in _find_modules(
+                model, None, search_class=[nn.Linear]
+            ):
+                _tmp = LoraInjectedLinear(
+                    _child_module.in_features,
+                    _child_module.out_features,
+                    _child_module.bias is not None,
+                    _child_module.weight,
+                    _child_module.bias,
+                    device=_child_module.weight.device,
+                    dtype=_child_module.weight.dtype,
+                    r=lora_rank,
+                    )
 
-                        layer._modules[_child_name] = _tmp
-                else:
-                    change_forward(layer)
+                _module._modules[name] = _tmp
+
+                # Allow the LoRSA weights to update
+                self.require_grad_params.append({'params': _module._modules[name].lora_up})
+                self.require_grad_params.append({'params': _module._modules[name].lora_down})
+                _module._modules[name].lora_up.requires_grad = True
+                _module._modules[name].lora_down.requires_grad = True
+                self.names.append(name)
         change_forward(self.model.diffusion_model)
+
+
+    def inject_trainable_lorsa(self, lora_rank, shrinkage_threshold):
+        def change_forward(model):
+            self.require_grad_params = []
+            self.names = []
+
+            for _module, name, _child_module in _find_modules(
+                model, None, search_class=[nn.Linear]
+            ):
+                _tmp = LorsaInjectedLinear(
+                    _child_module.in_features,
+                    _child_module.out_features,
+                    _child_module.bias is not None,
+                    _child_module.weight,
+                    _child_module.bias,
+                    device=_child_module.weight.device,
+                    dtype=_child_module.weight.dtype,
+                    r=lora_rank,
+                    shrinkage_threshold=shrinkage_threshold,
+                    )
+
+                _module._modules[name] = _tmp
+
+                # Allow the LoRSA weights to update
+                self.require_grad_params.append({'params': _module._modules[name].lora_up})
+                self.require_grad_params.append({'params': _module._modules[name].lora_down})
+                self.require_grad_params.append({'params': _module._modules[name].sparsity})
+                _module._modules[name].lora_up.requires_grad = True
+                _module._modules[name].lora_down.requires_grad = True
+                _module._modules[name].sparsity.requires_grad = True
+                self.names.append(name)
+        change_forward(self.model.diffusion_model)
+
+
+    def inject_trainable_linear(self):
+        def change_forward(model):
+            self.require_grad_params = []
+            self.names = []
+
+            for _module, name, _child_module in list(_find_modules(
+                model, None, search_class=[nn.Linear]
+            )):
+                print("Linear Injection : injecting linear into ", name)
+                print(type(_child_module))
+                _tmp = InjectedLinear(
+                    _child_module.in_features,
+                    _child_module.out_features,
+                    _child_module.bias is not None,
+                    _child_module.weight,
+                    _child_module.bias,
+                    device=_child_module.weight.device,
+                    dtype=_child_module.weight.dtype,
+                    )
+                assert torch.sum((_tmp.forward(torch.ones((1, _child_module.in_features))) - _child_module.forward(torch.ones((1, _child_module.in_features))))**2) == 0
+
+                _module._modules[name] = _tmp
+
+                # Allow the linear weights to update
+                self.require_grad_params.append({'params': _tmp.injected_linear_weight})
+                _tmp.injected_linear_weight.requires_grad = True
+                if _tmp.injected_linear_bias:
+                    self.require_grad_params.append({'params': _tmp.injected_linear_bias})
+                    _tmp.injected_linear_bias.requires_grad = True
+                self.names.append(name)
+        change_forward(self.model.diffusion_model)
+
 
     def configure_optimizers(self):
         lr = self.learning_rate
-        params = []
-        if self.freeze_model == 'crossattn-kv':
-            for x in self.model.diffusion_model.named_parameters():
-                if 'transformer_blocks' in x[0]:
-                    if 'attn2.to_k' in x[0] or 'attn2.to_v' in x[0]:
-                        params += [x[1]]
-                        print(x[0])
-        elif self.freeze_model == 'crossattn-kv-lora':
-            for x in self.model.diffusion_model.named_parameters():
-                if 'transformer_blocks' in x[0]:
-                    if 'lora_up' in x[0] or 'lora_down' in x[0]:
-                        params += [x[1]]
-                        print(x[0])
-        elif self.freeze_model == 'crossattn':
-            for x in self.model.diffusion_model.named_parameters():
-                if 'transformer_blocks' in x[0]:
-                    if 'attn2' in x[0]:
-                        params += [x[1]]
-                        print(x[0])
-        else:
+        params = self.require_grad_params
+        if params is None:
             params = list(self.model.parameters())
+
+        # params = []
+        # if self.freeze_model == 'crossattn-kv':
+        #     for x in self.model.diffusion_model.named_parameters():
+        #         if 'transformer_blocks' in x[0]:
+        #             if 'attn2.to_k' in x[0] or 'attn2.to_v' in x[0]:
+        #                 params += [x[1]]
+        #                 # print(x[0])
+        # elif self.freeze_model == 'crossattn-kv-lora' or self.freeze_model == 'crossattn-kv-lorsa':
+        #     for x in self.model.diffusion_model.named_parameters():
+        #         if 'transformer_blocks' in x[0]:
+        #             if 'lora_up' in x[0] or 'lora_down' in x[0] or 'sparse_linear' in x[0]:
+        #                 params += [x[1]]
+        #                 # print(x[0])
+        # elif self.freeze_model == 'crossattn':
+        #     for x in self.model.diffusion_model.named_parameters():
+        #         if 'transformer_blocks' in x[0]:
+        #             if 'attn2' in x[0]:
+        #                 params += [x[1]]
+        #                 # print(x[0])
+        # elif self.freeze_model == 'weight-lora' or self.freeze_model == 'weight-lorsa':
+        #     for x in self.model.diffusion_model.named_parameters():
+        #         if 'weight' in x[0]:
+        #             if 'lora_up' in x[0] or 'lora_down' in x[0] or 'sparse_linear' in x[0]:
+        #                 params += [x[1]]
+        #                 # print(x[0])
+        # elif self.freeze_model == 'weight':
+        #     for x in self.model.diffusion_model.named_parameters():
+        #         if 'weight' in x[0]:
+        #             params += [x[1]]
+        #             # print(x[0])
+        # else:
+        #     params = list(self.model.parameters())
 
         if self.cond_stage_trainable:
             print(f"{self.__class__.__name__}: Also optimizing conditioner params!")
             if self.add_token:
-                params = params + list(self.cond_stage_model.transformer.text_model.embeddings.token_embedding.parameters())
+                params = params + [{'params': self.cond_stage_model.transformer.text_model.embeddings.token_embedding.parameters()}]
             else:
-                params = params + list(self.cond_stage_model.parameters())
-
+                params = params + [{'params': self.cond_stage_model.parameters()}]
         if self.learn_logvar:
             print('Diffusion model optimizing logvar')
             params.append(self.logvar)

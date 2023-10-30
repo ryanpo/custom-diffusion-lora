@@ -16,7 +16,7 @@ def main(path, newtoken=0):
             elif '_' in files:
                 epoch_number = files.split('/')[-1].split('.ckpt')[0]
 
-            st = torch.load(files)["state_dict"]
+            st = torch.load(files)
             if len(layers) == 0:
                 for key in list(st.keys()):
                     if 'attn2.to_k' in key or 'attn2.to_v' in key:

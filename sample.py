@@ -113,14 +113,18 @@ def load_model_from_config(config, ckpt, verbose=False):
     pl_sd = torch.load(ckpt, map_location="cpu")
     if "global_step" in pl_sd:
         print(f"Global Step: {pl_sd['global_step']}")
-    sd = pl_sd["state_dict"]
+    sd = pl_sd
     model = instantiate_from_config(config.model)
-    if config.model.params.freeze_model == 'crossattn-kv-lora':
-        model.inject_trainable_lora(config.model.params.lora_rank)
 
     token_weights = sd["cond_stage_model.transformer.text_model.embeddings.token_embedding.weight"]
     del sd["cond_stage_model.transformer.text_model.embeddings.token_embedding.weight"]
     m, u = model.load_state_dict(sd, strict=False)
+    if 'lora' in config.model.params.freeze_model:
+        model.inject_trainable_lora(config.model.params.lora_rank)
+    elif 'lorsa' in config.model.params.freeze_model:
+        model.inject_trainable_lorsa(config.model.params.lora_rank, config.model.params.shrinkage_threshold)
+    else:
+        model.inject_trainable_linear()
     model.cond_stage_model.transformer.text_model.embeddings.token_embedding.weight.data[:token_weights.shape[0]] = token_weights
     if len(m) > 0 and verbose:
         print("missing keys:")

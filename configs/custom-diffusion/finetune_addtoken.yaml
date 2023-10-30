@@ -90,7 +90,7 @@
 # - To provide medical advice and medical results interpretation;
 # - To generate or disseminate information for the purpose to be used for administration of justice, law enforcement, immigration or asylum processes, such as predicting an individual will commit fraud/crime commitment (e.g. by text profiling, drawing causal relationships between assertions made in documents, indiscriminate and arbitrarily-targeted use).
 model:
-  base_learning_rate: 1.0e-05
+  base_learning_rate: 1.0e-05 # 1.0e-05  1e-6 is too low, 1e-4 is too high, 3e-5 is decent
   target: src.model.CustomDiffusion
   params:
     linear_start: 0.00085
@@ -104,7 +104,7 @@ model:
     channels: 4
     cond_stage_trainable: True   # Note: different from the one we trained before
     add_token: True
-    freeze_model: "crossattn-kv"
+    freeze_model: "linear" #"crossattn-kv"
     conditioning_key: crossattn
     monitor: val/loss_simple_ema
     scale_factor: 0.18215
